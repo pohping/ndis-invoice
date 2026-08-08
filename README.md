@@ -1,36 +1,91 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# NDIS Invoice Management System
 
-## Getting Started
+A participant invoicing platform built for the Witty Data assessment — covering participant/provider management, NDIS rate-set Excel import, and invoice management with rate/price matching.
 
-First, run the development server:
+## Tech Stack
+
+- Node.js v24.18.0, Next.js v16.2.10, TypeScript
+- PostgreSQL (via Kysely)
+- antd, TailwindCSS
+
+## Setup
+
+### 1. Prerequisites
+
+- Node.js v24.18.0
+- Docker (for Postgres [+ MinIO if used]), or your own local instances
+
+### 2. Install
+
+```bash
+npm install
+```
+
+### 3. Start infrastructure
+
+```bash
+docker compose up -d
+```
+
+### 4. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+### 5. Run the app
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Visit `http://localhost:3000`.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+[Confirm you actually ran steps 1–5 in order against a clean database before submitting.]
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## What's Implemented
 
-## Learn More
+### Primary Requirements (Section 9)
 
-To learn more about Next.js, take a look at the following resources:
+- [x] Participant (Client) Management
+- [x] Provider Management
+- [x] Invoice Management (create/edit/list/view, rate-set matching, price lookup, draft vs completed validation)
+- [x] Rate Set Management
+- [x] NDIS Excel Import (idempotent, all worksheets, categories/items/attributes/prices)
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### Secondary Requirements (Section 10) — optional for junior candidates
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+- [ ] System User Management
+- [ ] Authentication
+- [ ] RBAC
+- [ ] Audit Logging
 
-## Deploy on Vercel
+### Extended: AI-based PDF Invoice Extraction (Section 11) — optional
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+- [ ] Invoice upload
+- [ ] MinIO file storage
+- [ ] AI extraction
+- [ ] Draft creation + mapping cascade (participant/provider/rate-set/support-item)
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## What's Incomplete
+
+- **Section 10 (Secondary)** — User management, login/session (Argon2), RBAC permission checks, and audit logging are not implemented.
+- **Section 11 (AI Extraction)** — PDF upload, MinIO storage, OpenAI/OpenRouter extraction, and auto draft-invoice creation are not implemented.
+
+## Known Limitations
+
+- No authentication — all API routes are currently open.
+- No role-based permission checks.
+- No audit trail for create/update/delete actions.
+- Invoice AI upload flow is not available.
+
+## If I Had More Time
+
+1. **Authentication + RBAC**  
+   Implement Argon2 login, session tokens, and enforce permissions on every write endpoint. This is the highest-priority missing piece for a usable system.
+
+2. **Audit logging**  
+   Record actor, action, entity, and changes into `audit_log` on every mutation.
+
+3. **AI invoice extraction**  
+   Add PDF upload → MinIO → OpenRouter/OpenAI structured extraction → draft invoice creation with participant/provider mapping.
