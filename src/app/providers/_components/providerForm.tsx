@@ -7,8 +7,8 @@ import {
    type FormProps,
    Flex,
 } from 'antd';
-import type { Provider } from '@/db/types';
-import { trimRequired, optionalTrim } from '@/lib/form-validator';
+import type { Provider } from '@/types';
+import { optionalTrim } from '@/lib/form-validator';
 import { swrMutation } from '@/lib/swr-client';
 import useSWRMutation from 'swr/mutation';
 
