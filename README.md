@@ -1,5 +1,62 @@
 # NDIS Invoice Management System
 
+A participant invoicing platform covering participant/provider management, NDIS rate-set Excel import, and invoice management with rate/price matching.
+
+**Live demo:** [https://ndis-invoice-flax.vercel.app/](https://ndis-invoice-flax.vercel.app/)
+
+## Tech Stack
+
+- Node.js v24.18.0, Next.js v16.2.10, TypeScript
+- PostgreSQL (via Kysely)
+- antd, TailwindCSS
+
+## Setup
+
+### 1. Prerequisites
+
+- Node.js v24.18.0
+- Docker (for Postgres [+ MinIO if used]), or your own local instances
+
+### 2. Install
+
+```bash
+npm install
+```
+
+### 3. Start infrastructure
+
+```bash
+docker compose up -d
+```
+
+### 4. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+### 5. Run the app
+
+```bash
+npm run dev
+```
+
+Visit `http://localhost:3000`.
+
+[Confirm you actually ran steps 1–5 in order against a clean database before submitting.]
+
+## What's Implemented
+
+- Participant (Client) Management
+- Provider Management
+- Invoice Management (create/edit/list/view, rate-set matching, price lookup, draft vs completed validation)
+- Rate Set Management
+- NDIS Excel Import (idempotent, all worksheets, categories/items/attributes/prices)
+
+   https://drive.google.com/drive/folders/1l-jP0nMA01igZxTRMBFfxhViCbhHqdIx?usp=sharing
+
+<!-- # NDIS Invoice Management System
+
 A participant invoicing platform built for the Witty Data assessment — covering participant/provider management, NDIS rate-set Excel import, and invoice management with rate/price matching.
 
 ## Tech Stack
@@ -81,11 +138,11 @@ Visit `http://localhost:3000`.
 
 ## If I Had More Time
 
-1. **Authentication + RBAC**  
+1. **Authentication + RBAC**
    Implement Argon2 login, session tokens, and enforce permissions on every write endpoint. This is the highest-priority missing piece for a usable system.
 
-2. **Audit logging**  
+2. **Audit logging**
    Record actor, action, entity, and changes into `audit_log` on every mutation.
 
-3. **AI invoice extraction**  
-   Add PDF upload → MinIO → OpenRouter/OpenAI structured extraction → draft invoice creation with participant/provider mapping.
+3. **AI invoice extraction**
+   Add PDF upload → MinIO → OpenRouter/OpenAI structured extraction → draft invoice creation with participant/provider mapping. -->
