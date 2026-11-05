@@ -9,12 +9,22 @@ export function apiError(err: unknown) {
    const isDev = process.env.NODE_ENV === 'development';
 
    if (err instanceof ApiError) {
+      // return NextResponse.json(
+      //    {
+      //       error: {
+      //          code: err.code,
+      //          message: isDev ? err.message : 'An error occurred.',
+      //          ...(isDev && err.details ? { details: err.details } : {}),
+      //       },
+      //    },
+      //    { status: err.status },
+      // );
       return NextResponse.json(
          {
             error: {
                code: err.code,
-               message: isDev ? err.message : 'An error occurred.',
-               ...(isDev && err.details ? { details: err.details } : {}),
+               message: err.message,
+               ...(err.details ? { details: err.details } : {}),
             },
          },
          { status: err.status },
