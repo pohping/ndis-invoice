@@ -1,4 +1,5 @@
 import { db } from '@/lib/db';
+import { sql } from 'kysely';
 import { NotFoundError } from '@/lib/errors';
 import * as XLSX from 'xlsx';
 
@@ -215,10 +216,43 @@ export interface ImportSummary {
 /**
  * Idempotently imports a parsed NDIS pricing workbook into an existing rate_set
  */
+const WRITE_BATCH_SIZE = 250;
+
+function chunks<T>(items: T[], size = WRITE_BATCH_SIZE): T[][] {
+   const batches: T[][] = [];
+   for (let i = 0; i < items.length; i += size) batches.push(items.slice(i, i + size));
+   return batches;
+}
+
+async function writeBatches<T>(items: T[], write: (batch: T[]) => Promise<unknown>) {
+   for (const batch of chunks(items)) await write(batch);
+}
+
+function isoDateKey(value: Date | string | null): string {
+   if (value === null) return '';
+   return (value instanceof Date ? value : new Date(value)).toISOString().slice(0, 10);
+}
+
+function makePriceKey(
+   itemId: number,
+   typeId: number | null,
+   regionCode: string | null,
+   startDate: string,
+   endDate: string | null,
+): string {
+   return [itemId, typeId ?? 'null', regionCode ?? 'null', startDate, endDate ?? ''].join('::');
+}
+
+/**
+ * Imports the workbook atomically.
+ *
+ * Existing rows are fetched in bulk and matched in memory. Writes are batched
+ * in groups of 250 to avoid thousands of sequential database round-trips.
+ */
 export async function importRateSetExcel(rateSetId: number, file: File) {
    const rateSet = await db
       .selectFrom('rate_set')
-      .selectAll()
+      .select('id')
       .where('id', '=', rateSetId)
       .executeTakeFirst();
 
@@ -240,367 +274,333 @@ export async function importRateSetExcel(rateSetId: number, file: File) {
       pricesRemoved: 0,
    };
 
+   if (rows.length === 0) return summary;
+
    await db.transaction().execute(async (trx) => {
-      /* ------------------- Pricing regions (global reference data) ------------------ */
-      const regionCodeByColumn = new Map<string, string>();
-      for (const { column, fullLabel } of PRICING_REGION_COLUMNS) {
+      const now = new Date();
+
+      /* Global pricing-region reference data */
+      const regionRows = PRICING_REGION_COLUMNS.flatMap(({ column, fullLabel }) => {
          const label = headerReader.string(column);
-         if (!label) continue; // header missing this column in this file; skip gracefully
-         const code = toCode(label);
-         regionCodeByColumn.set(column, code);
+         return label ? [{ code: toCode(label), label, full_label: fullLabel, column }] : [];
+      });
+      const regionCodeByColumn = new Map(regionRows.map((region) => [region.column, region.code]));
+      const existingRegions = regionRows.length
+         ? await trx.selectFrom('rate_set_support_item_pricing_region')
+              .selectAll()
+              .where('code', 'in', regionRows.map((region) => region.code))
+              .execute()
+         : [];
+      const regionByCode = new Map(existingRegions.map((region) => [region.code, region]));
 
-         const existing = await trx
-            .selectFrom('rate_set_support_item_pricing_region')
-            .selectAll()
-            .where('code', '=', code)
-            .executeTakeFirst();
-
-         if (existing) {
-            if (existing.label !== label || existing.full_label !== fullLabel) {
-               await trx
-                  .updateTable('rate_set_support_item_pricing_region')
-                  .set({ label, full_label: fullLabel })
-                  .where('code', '=', code)
-                  .execute();
-            }
-         } else {
-            await trx
-               .insertInto('rate_set_support_item_pricing_region')
-               .values({ code, label, full_label: fullLabel })
-               .execute();
+      for (const region of regionRows) {
+         const existing = regionByCode.get(region.code);
+         if (existing && (existing.label !== region.label || existing.full_label !== region.full_label)) {
+            await trx.updateTable('rate_set_support_item_pricing_region')
+               .set({ label: region.label, full_label: region.full_label })
+               .where('code', '=', region.code).execute();
+         } else if (!existing) {
+            await trx.insertInto('rate_set_support_item_pricing_region')
+               .values({ code: region.code, label: region.label, full_label: region.full_label })
+               .onConflict((oc) => oc.column('code').doNothing()).execute();
          }
       }
 
-      /* ------------------- Attribute types (global reference data) ------------------ */
-      for (const { column, code } of ATTRIBUTE_COLUMNS) {
+      /* Global attribute types */
+      const attributeTypeRows = ATTRIBUTE_COLUMNS.flatMap(({ column, code }) => {
          const label = headerReader.string(column);
-         if (!label) continue;
+         return label ? [{ code, label }] : [];
+      });
+      const existingAttributeTypes = attributeTypeRows.length
+         ? await trx.selectFrom('rate_set_support_item_attribute_type')
+              .selectAll()
+              .where('code', 'in', attributeTypeRows.map((item) => item.code))
+              .execute()
+         : [];
+      const attributeTypeByCode = new Map(existingAttributeTypes.map((item) => [item.code, item]));
 
-         const existing = await trx
-            .selectFrom('rate_set_support_item_attribute_type')
-            .selectAll()
-            .where('code', '=', code)
-            .executeTakeFirst();
-
-         if (existing) {
-            if (existing.label !== label) {
-               await trx
-                  .updateTable('rate_set_support_item_attribute_type')
-                  .set({ label })
-                  .where('code', '=', code)
-                  .execute();
-            }
-         } else {
-            await trx
-               .insertInto('rate_set_support_item_attribute_type')
-               .values({ code, label })
-               .execute();
+      for (const attribute of attributeTypeRows) {
+         const existing = attributeTypeByCode.get(attribute.code);
+         if (existing && existing.label !== attribute.label) {
+            await trx.updateTable('rate_set_support_item_attribute_type')
+               .set({ label: attribute.label }).where('code', '=', attribute.code).execute();
+         } else if (!existing) {
+            await trx.insertInto('rate_set_support_item_attribute_type')
+               .values(attribute).onConflict((oc) => oc.column('code').doNothing()).execute();
          }
       }
 
-      /* --------------- Support item types (global reference data, from Column AB) --- */
-      const typeIdByCode = new Map<string, number>();
-      const distinctTypeLabels = new Map<string, string>(); // code -> label
+      /* Global support-item types */
+      const distinctTypes = new Map<string, string>();
       for (const row of rows) {
-         if (!row.supportTypeLabel) continue;
-         distinctTypeLabels.set(
-            toCode(row.supportTypeLabel),
-            row.supportTypeLabel,
-         );
+         if (row.supportTypeLabel) distinctTypes.set(toCode(row.supportTypeLabel), row.supportTypeLabel);
       }
+      const typeCodes = [...distinctTypes.keys()];
+      const existingTypes = typeCodes.length
+         ? await trx.selectFrom('rate_set_support_item_type')
+              .selectAll().where('code', 'in', typeCodes).execute()
+         : [];
+      const typeByCode = new Map(existingTypes.map((type) => [type.code, type]));
+      const typeIdByCode = new Map(existingTypes.map((type) => [type.code, type.id]));
 
-      for (const [code, label] of distinctTypeLabels) {
-         const existing = await trx
-            .selectFrom('rate_set_support_item_type')
-            .selectAll()
-            .where('code', '=', code)
-            .executeTakeFirst();
-
-         if (existing) {
-            typeIdByCode.set(code, existing.id);
-            if (existing.label !== label) {
-               await trx
-                  .updateTable('rate_set_support_item_type')
-                  .set({ label })
-                  .where('id', '=', existing.id)
-                  .execute();
-            }
-         } else {
-            const created = await trx
-               .insertInto('rate_set_support_item_type')
+      for (const [code, label] of distinctTypes) {
+         const existing = typeByCode.get(code);
+         if (existing && existing.label !== label) {
+            await trx.updateTable('rate_set_support_item_type')
+               .set({ label }).where('id', '=', existing.id).execute();
+         } else if (!existing) {
+            const inserted = await trx.insertInto('rate_set_support_item_type')
                .values({ code, label })
-               .returningAll()
-               .executeTakeFirstOrThrow();
-            typeIdByCode.set(code, created.id);
+               .onConflict((oc) => oc.column('code').doNothing())
+               .returning('id').executeTakeFirst();
+            if (inserted) typeIdByCode.set(code, inserted.id);
+            else {
+               const concurrent = await trx.selectFrom('rate_set_support_item_type')
+                  .select('id').where('code', '=', code).executeTakeFirstOrThrow();
+               typeIdByCode.set(code, concurrent.id);
+            }
          }
       }
 
-      /* ------------------------------- Categories ------------------------------- */
-      const seenCategoryNumbers = new Set<string>();
-      const seenItemKeys = new Set<string>(); // `${categoryNumber}::${itemNumber}`
-      // `${support_item_id}::${type_id ?? 'null'}::${pricing_region_code}::${start_date}::${end_date ?? ''}`
-      const seenPriceKeys = new Set<string>();
-
-      const categoryByNumber = new Map<string, { id: number }>();
+      /* Categories: one read, batched upsert, one bulk deactivation */
       const distinctCategories = new Map<string, string>();
-      for (const row of rows)
-         distinctCategories.set(row.categoryNumber, row.categoryName);
-
-      let sortIdx = 1;
-      for (const [categoryNumber, categoryName] of [
-         ...distinctCategories.entries(),
-      ].sort((a, b) =>
+      for (const row of rows) distinctCategories.set(row.categoryNumber, row.categoryName);
+      const sortedCategories = [...distinctCategories.entries()].sort((a, b) =>
          a[0].localeCompare(b[0], undefined, { numeric: true }),
-      )) {
-         seenCategoryNumbers.add(categoryNumber);
-         const existing = await trx
-            .selectFrom('rate_set_category')
-            .selectAll()
-            .where('rate_set_id', '=', rateSetId)
-            .where('category_number', '=', categoryNumber)
-            .executeTakeFirst();
+      );
+      const categoryNumbers = sortedCategories.map(([number]) => number);
+      const existingCategories = await trx.selectFrom('rate_set_category')
+         .selectAll().where('rate_set_id', '=', rateSetId)
+         .where('category_number', 'in', categoryNumbers).execute();
+      const categoryByNumber = new Map(existingCategories.map((item) => [item.category_number, item]));
 
+      const categoryWrites: Array<{
+         id?: number; rate_set_id: number; category_number: string; category_name: string;
+         sorting: number; deleted_at?: Date | null; deactivated_at?: Date | null; updated_at?: Date;
+      }> = [];
+
+      sortedCategories.forEach(([categoryNumber, categoryName], index) => {
+         const existing = categoryByNumber.get(categoryNumber);
          if (existing) {
-            if (
-               existing.category_name !== categoryName ||
-               existing.deleted_at ||
-               existing.deactivated_at
-            ) {
-               await trx
-                  .updateTable('rate_set_category')
-                  .set({
-                     category_name: categoryName,
-                     sorting: sortIdx,
-                     deleted_at: null,
-                     deactivated_at: null,
-                     updated_at: new Date(),
-                  })
-                  .where('id', '=', existing.id)
-                  .execute();
+            if (existing.category_name !== categoryName || existing.deleted_at || existing.deactivated_at) {
                summary.categoriesUpdated++;
             }
-            categoryByNumber.set(categoryNumber, { id: existing.id });
+            categoryWrites.push({
+               id: existing.id, rate_set_id: rateSetId, category_number: categoryNumber,
+               category_name: categoryName, sorting: index + 1,
+               deleted_at: null, deactivated_at: null, updated_at: now,
+            });
          } else {
-            const created = await trx
-               .insertInto('rate_set_category')
-               .values({
-                  rate_set_id: rateSetId,
-                  category_number: categoryNumber,
-                  category_name: categoryName,
-                  sorting: sortIdx,
-               })
-               .returningAll()
-               .executeTakeFirstOrThrow();
-            categoryByNumber.set(categoryNumber, { id: created.id });
+            categoryWrites.push({
+               rate_set_id: rateSetId, category_number: categoryNumber,
+               category_name: categoryName, sorting: index + 1,
+            });
             summary.categoriesCreated++;
          }
-         sortIdx++;
+      });
+
+      await writeBatches(categoryWrites, (batch) =>
+         trx.insertInto('rate_set_category').values(batch)
+            .onConflict((oc) => oc.column('id').doUpdateSet({
+               category_name: sql.ref('excluded.category_name'),
+               sorting: sql.ref('excluded.sorting'),
+               deleted_at: null, deactivated_at: null, updated_at: now,
+            })).execute(),
+      );
+
+      const allCategories = await trx.selectFrom('rate_set_category')
+         .selectAll().where('rate_set_id', '=', rateSetId)
+         .where('deleted_at', 'is', null).execute();
+      const categoryIdByNumber = new Map(allCategories.map((item) => [item.category_number, item.id]));
+      const missingCategoryIds = allCategories
+         .filter((item) => !distinctCategories.has(item.category_number))
+         .map((item) => item.id);
+
+      if (missingCategoryIds.length) {
+         await trx.updateTable('rate_set_category').set({ deactivated_at: now })
+            .where('id', 'in', missingCategoryIds).execute();
+         summary.categoriesDeactivated = missingCategoryIds.length;
       }
 
-      const allCategories = await trx
-         .selectFrom('rate_set_category')
-         .selectAll()
-         .where('rate_set_id', '=', rateSetId)
-         .where('deleted_at', 'is', null)
-         .execute();
-      for (const cat of allCategories) {
-         if (!seenCategoryNumbers.has(cat.category_number)) {
-            await trx
-               .updateTable('rate_set_category')
-               .set({ deactivated_at: new Date() })
-               .where('id', '=', cat.id)
-               .execute();
-            summary.categoriesDeactivated++;
-         }
-      }
-
-      /* ------------------------------ Support items ------------------------------ */
+      /* Support items: resolve all item IDs with one bulk upsert */
+      const distinctItems = new Map<string, { row: ParsedRow; categoryId: number; sorting: number }>();
       let itemSort = 1;
       for (const row of rows) {
-         const key = `${row.categoryNumber}::${row.itemNumber}`;
-         if (seenItemKeys.has(key)) continue; // dedupe within this import
-         seenItemKeys.add(key);
+         const workbookKey = row.categoryNumber + '::' + row.itemNumber;
+         if (distinctItems.has(workbookKey)) continue;
+         const categoryId = categoryIdByNumber.get(row.categoryNumber);
+         if (categoryId === undefined) throw new Error('Unable to resolve category ' + row.categoryNumber);
+         distinctItems.set(workbookKey, { row, categoryId, sorting: itemSort++ });
+      }
 
-         const categoryId = categoryByNumber.get(row.categoryNumber)!.id;
+      const categoryIds = [...new Set([...distinctItems.values()].map((item) => item.categoryId))];
+      const existingItems = await trx.selectFrom('rate_set_support_item')
+         .selectAll().where('rate_set_id', '=', rateSetId)
+         .where('category_id', 'in', categoryIds).execute();
+      const existingItemByKey = new Map(existingItems.map((item) => [
+         item.category_id + '::' + item.item_number, item,
+      ]));
 
-         const existing = await trx
-            .selectFrom('rate_set_support_item')
-            .selectAll()
-            .where('rate_set_id', '=', rateSetId)
-            .where('category_id', '=', categoryId)
-            .where('item_number', '=', row.itemNumber)
-            .executeTakeFirst();
+      const itemWrites: Array<{
+         id?: number; rate_set_id: number; category_id: number; item_number: string;
+         item_name: string; unit: string | null; sorting: number;
+         deleted_at?: Date | null; deactivated_at?: Date | null; updated_at?: Date;
+      }> = [];
 
-         let itemId: number;
+      for (const { row, categoryId, sorting } of distinctItems.values()) {
+         const existing = existingItemByKey.get(categoryId + '::' + row.itemNumber);
          if (existing) {
-            const changed =
-               existing.item_name !== row.itemName ||
-               existing.unit !== row.unit ||
-               existing.deleted_at ||
-               existing.deactivated_at;
-            if (changed) {
-               await trx
-                  .updateTable('rate_set_support_item')
-                  .set({
-                     item_name: row.itemName,
-                     unit: row.unit,
-                     sorting: itemSort,
-                     deleted_at: null,
-                     deactivated_at: null,
-                     updated_at: new Date(),
-                  })
-                  .where('id', '=', existing.id)
-                  .execute();
-               summary.itemsUpdated++;
-            }
-            itemId = existing.id;
+            if (existing.item_name !== row.itemName || existing.unit !== (row.unit || null) ||
+                existing.deleted_at || existing.deactivated_at) summary.itemsUpdated++;
+            itemWrites.push({
+               id: existing.id, rate_set_id: rateSetId, category_id: categoryId,
+               item_number: row.itemNumber, item_name: row.itemName, unit: row.unit || null,
+               sorting, deleted_at: null, deactivated_at: null, updated_at: now,
+            });
          } else {
-            const created = await trx
-               .insertInto('rate_set_support_item')
-               .values({
-                  rate_set_id: rateSetId,
-                  category_id: categoryId,
-                  item_number: row.itemNumber,
-                  item_name: row.itemName,
-                  unit: row.unit,
-                  sorting: itemSort,
-               })
-               .returningAll()
-               .executeTakeFirstOrThrow();
-            itemId = created.id;
+            itemWrites.push({
+               rate_set_id: rateSetId, category_id: categoryId,
+               item_number: row.itemNumber, item_name: row.itemName,
+               unit: row.unit || null, sorting,
+            });
             summary.itemsCreated++;
          }
-         itemSort++;
+      }
 
-         // Attributes (upsert boolean flags)
-         for (const [attrCode, value] of Object.entries(row.attributes)) {
-            const existingAttr = await trx
-               .selectFrom('rate_set_support_item_attribute')
-               .selectAll()
-               .where('support_item_id', '=', itemId)
-               .where('attribute_code', '=', attrCode)
-               .executeTakeFirst();
+      const itemIdByWorkbookKey = new Map<string, number>();
+      const writtenItems: Array<{ id: number; category_id: number; item_number: string }> = [];
+      for (const batch of chunks(itemWrites)) {
+         const written = await trx.insertInto('rate_set_support_item').values(batch)
+            .onConflict((oc) => oc.column('id').doUpdateSet({
+               item_name: sql.ref('excluded.item_name'),
+               unit: sql.ref('excluded.unit'),
+               sorting: sql.ref('excluded.sorting'),
+               deleted_at: null, deactivated_at: null, updated_at: now,
+            }))
+            .returning(['id', 'category_id', 'item_number']).execute();
+         writtenItems.push(...written);
+      }
+      for (const item of writtenItems) {
+         itemIdByWorkbookKey.set(item.category_id + '::' + item.item_number, item.id);
+      }
 
-            if (existingAttr) {
-               if (existingAttr.value !== value) {
-                  await trx
-                     .updateTable('rate_set_support_item_attribute')
-                     .set({ value })
-                     .where('id', '=', existingAttr.id)
-                     .execute();
-               }
-            } else {
-               await trx
-                  .insertInto('rate_set_support_item_attribute')
-                  .values({
-                     support_item_id: itemId,
-                     attribute_code: attrCode,
-                     value,
-                  })
-                  .execute();
-            }
+      /* Attributes: read once, then batch only changed/new values */
+      const itemIds = writtenItems.map((item) => item.id);
+      const existingAttributes = itemIds.length
+         ? await trx.selectFrom('rate_set_support_item_attribute')
+              .selectAll().where('support_item_id', 'in', itemIds).execute()
+         : [];
+      const attributeByKey = new Map(existingAttributes.map((item) => [
+         item.support_item_id + '::' + item.attribute_code, item,
+      ]));
+      const attributeWrites: Array<{
+         id?: number; support_item_id: number; attribute_code: string; value: boolean;
+      }> = [];
+
+      for (const { row, categoryId } of distinctItems.values()) {
+         const itemId = itemIdByWorkbookKey.get(categoryId + '::' + row.itemNumber);
+         if (itemId === undefined) continue;
+         for (const [code, value] of Object.entries(row.attributes)) {
+            const existing = attributeByKey.get(itemId + '::' + code);
+            if (existing && existing.value === value) continue;
+            attributeWrites.push({
+               ...(existing ? { id: existing.id } : {}),
+               support_item_id: itemId, attribute_code: code, value,
+            });
          }
+      }
 
-         const typeId = row.supportTypeLabel
-            ? (typeIdByCode.get(toCode(row.supportTypeLabel)) ?? null)
-            : null;
+      await writeBatches(attributeWrites, (batch) =>
+         trx.insertInto('rate_set_support_item_attribute').values(batch)
+            .onConflict((oc) => oc.column('id').doUpdateSet({
+               value: sql.ref('excluded.value'),
+            })).execute(),
+      );
 
-         // Prices per pricing region
+      /* Prices: read once for this rate set, then batch changed/new prices */
+      const existingPrices = await trx.selectFrom('rate_set_support_item_price')
+         .selectAll().where('rate_set_id', '=', rateSetId).execute();
+      const existingPriceByKey = new Map<string, (typeof existingPrices)[number]>();
+      for (const price of existingPrices) {
+         const key = makePriceKey(
+            price.support_item_id, price.type_id, price.pricing_region_code,
+            isoDateKey(price.start_date), price.end_date ? isoDateKey(price.end_date) : null,
+         );
+         if (!existingPriceByKey.has(key)) existingPriceByKey.set(key, price);
+      }
+
+      const seenPriceKeys = new Set<string>();
+      const priceWrites: Array<{
+         id?: number; rate_set_id: number; support_item_id: number; type_id: number | null;
+         pricing_region_code: string; unit_price: string; start_date: string; end_date: string | null;
+      }> = [];
+
+      // Iterate all rows here: the same support item can have multiple effective-date ranges.
+      for (const row of rows) {
+         const workbookItemKey = row.categoryNumber + '::' + row.itemNumber;
+         const itemId = itemIdByWorkbookKey.get(workbookItemKey);
+         if (itemId === undefined) continue;
+         const typeId = row.supportTypeLabel ? (typeIdByCode.get(toCode(row.supportTypeLabel)) ?? null) : null;
+
          for (const [column, unitPrice] of Object.entries(row.prices)) {
             if (unitPrice === null) continue;
-
             const regionCode = regionCodeByColumn.get(column);
-            if (!regionCode) continue; // header didn't resolve a code for this column; skip
+            if (!regionCode) continue;
 
-            const roundedPrice = unitPrice.toFixed(4); // schema: numeric(24,4)
+            const key = makePriceKey(itemId, typeId, regionCode, row.startDate, row.endDate);
+            seenPriceKeys.add(key);
+            const existing = existingPriceByKey.get(key);
+            const roundedPrice = unitPrice.toFixed(4);
 
-            const priceKey = `${itemId}::${typeId ?? 'null'}::${regionCode}::${row.startDate}::${row.endDate ?? ''}`;
-            seenPriceKeys.add(priceKey);
+            if (existing && Number(existing.unit_price) === Number(roundedPrice)) continue;
 
-            const existingPrice = await trx
-               .selectFrom('rate_set_support_item_price')
-               .selectAll()
-               .where('rate_set_id', '=', rateSetId)
-               .where('support_item_id', '=', itemId)
-               .where('pricing_region_code', '=', regionCode)
-               .where('type_id', typeId === null ? 'is' : '=', typeId)
-               .where('start_date', '=', new Date(row.startDate))
-               .where(
-                  'end_date',
-                  row.endDate ? '=' : 'is',
-                  row.endDate ? new Date(row.endDate) : null,
-               )
-               .executeTakeFirst();
-
-            if (existingPrice) {
-               if (Number(existingPrice.unit_price) !== Number(roundedPrice)) {
-                  await trx
-                     .updateTable('rate_set_support_item_price')
-                     .set({ unit_price: roundedPrice, updated_at: new Date() })
-                     .where('id', '=', existingPrice.id)
-                     .execute();
-                  summary.pricesUpdated++;
-               }
-            } else {
-               await trx
-                  .insertInto('rate_set_support_item_price')
-                  .values({
-                     rate_set_id: rateSetId,
-                     support_item_id: itemId,
-                     type_id: typeId,
-                     pricing_region_code: regionCode,
-                     unit_price: roundedPrice,
-                     start_date: row.startDate,
-                     end_date: row.endDate,
-                  })
-                  .execute();
-               summary.pricesCreated++;
-            }
+            priceWrites.push({
+               ...(existing ? { id: existing.id } : {}),
+               rate_set_id: rateSetId, support_item_id: itemId, type_id: typeId,
+               pricing_region_code: regionCode, unit_price: roundedPrice,
+               start_date: row.startDate, end_date: row.endDate,
+            });
+            if (existing) summary.pricesUpdated++;
+            else summary.pricesCreated++;
          }
       }
 
-      // Deactivate support items missing from the file
-      const allItems = await trx
-         .selectFrom('rate_set_support_item')
-         .selectAll()
+      await writeBatches(priceWrites, (batch) =>
+         trx.insertInto('rate_set_support_item_price').values(batch)
+            .onConflict((oc) => oc.column('id').doUpdateSet({
+               unit_price: sql.ref('excluded.unit_price'), updated_at: now,
+            })).execute(),
+      );
+
+      /* Deactivate missing items in one statement */
+      const seenItemKeys = new Set([...distinctItems.keys()]);
+      const allItems = await trx.selectFrom('rate_set_support_item')
+         .select(['id', 'category_id', 'item_number'])
          .where('rate_set_id', '=', rateSetId)
-         .where('deleted_at', 'is', null)
-         .execute();
-      for (const item of allItems) {
-         const category = allCategories.find((c) => c.id === item.category_id);
-         const key = `${category?.category_number}::${item.item_number}`;
-         if (!seenItemKeys.has(key)) {
-            await trx
-               .updateTable('rate_set_support_item')
-               .set({ deactivated_at: new Date() })
-               .where('id', '=', item.id)
-               .execute();
-            summary.itemsDeactivated++;
-         }
+         .where('deleted_at', 'is', null).execute();
+      const missingItemIds = allItems.filter((item) =>
+         !seenItemKeys.has(item.category_id + '::' + item.item_number),
+      ).map((item) => item.id);
+
+      if (missingItemIds.length) {
+         await trx.updateTable('rate_set_support_item').set({ deactivated_at: now })
+            .where('id', 'in', missingItemIds).execute();
+         summary.itemsDeactivated = missingItemIds.length;
       }
-      // Remove prices missing from the file.
-      const allPrices = await trx
-         .selectFrom('rate_set_support_item_price')
-         .selectAll()
-         .where('rate_set_id', '=', rateSetId)
-         .execute();
 
-      for (const price of allPrices) {
-         const key = [
-            price.support_item_id,
-            price.type_id ?? 'null',
-            price.pricing_region_code,
-            toIsoDate(price.start_date),
-            price.end_date ? toIsoDate(price.end_date) : '',
-         ].join('::');
+      /* Delete missing prices in one statement */
+      const missingPriceIds = existingPrices.filter((price) => {
+         const key = makePriceKey(
+            price.support_item_id, price.type_id, price.pricing_region_code,
+            isoDateKey(price.start_date), price.end_date ? isoDateKey(price.end_date) : null,
+         );
+         return !seenPriceKeys.has(key);
+      }).map((price) => price.id);
 
-         if (!seenPriceKeys.has(key)) {
-            await trx
-               .deleteFrom('rate_set_support_item_price')
-               .where('id', '=', price.id)
-               .execute();
-            summary.pricesRemoved++;
-         }
+      if (missingPriceIds.length) {
+         await trx.deleteFrom('rate_set_support_item_price')
+            .where('id', 'in', missingPriceIds).execute();
+         summary.pricesRemoved = missingPriceIds.length;
       }
    });
 
