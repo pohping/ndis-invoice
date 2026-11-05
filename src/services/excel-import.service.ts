@@ -274,7 +274,6 @@ export async function importRateSetExcel(rateSetId: number, file: File) {
       pricesRemoved: 0,
    };
 
-   if (rows.length === 0) return summary;
 
    await db.transaction().execute(async (trx) => {
       const now = new Date();
@@ -573,7 +572,11 @@ export async function importRateSetExcel(rateSetId: number, file: File) {
       );
 
       /* Deactivate missing items in one statement */
-      const seenItemKeys = new Set([...distinctItems.keys()]);
+      const seenItemKeys = new Set(
+         [...distinctItems.values()].map(({ row, categoryId }) =>
+            categoryId + '::' + row.itemNumber,
+         ),
+      );
       const allItems = await trx.selectFrom('rate_set_support_item')
          .select(['id', 'category_id', 'item_number'])
          .where('rate_set_id', '=', rateSetId)
